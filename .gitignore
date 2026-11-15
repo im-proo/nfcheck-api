@@ -1,6 +1,6 @@
 # Binaries & build outputs
-nfchecker
-server
+/nfchecker
+/server
 *.exe
 *.dll
 *.so
