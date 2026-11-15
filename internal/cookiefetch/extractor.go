@@ -145,9 +145,11 @@ func extractRar(data []byte) ([]*models.CookieSet, error) {
 	}
 	defer os.RemoveAll(outDir)
 
-	// Safe command execution without shell injection
-	if err := safeExec("unrar", "x", "-y", tmp.Name(), outDir+"/"); err != nil {
-		_ = safeExec("bsdtar", "-xf", tmp.Name(), "-C", outDir)
+	// Safe command execution without shell injection (fallback order: bsdtar -> 7z -> unrar)
+	if err := safeExec("bsdtar", "-xf", tmp.Name(), "-C", outDir); err != nil {
+		if err2 := safeExec("7z", "x", "-y", tmp.Name(), "-o"+outDir); err2 != nil {
+			_ = safeExec("unrar", "x", "-y", tmp.Name(), outDir+"/")
+		}
 	}
 
 	return extractFromDir(outDir)

@@ -24,8 +24,8 @@ FROM alpine:3.19
 
 # ca-certificates: TLS verification for outgoing HTTPS requests to Netflix & proxies
 # tzdata: timezone data for scheduling & timestamps
-# unrar & bsdtar: external utilities for RAR cookie batch extraction
-RUN apk --no-cache add ca-certificates tzdata unrar bsdtar
+# libarchive-tools (provides bsdtar) & 7zip (provides 7z): external utilities for RAR/archive extraction
+RUN apk --no-cache add ca-certificates tzdata libarchive-tools 7zip
 
 WORKDIR /app
 
