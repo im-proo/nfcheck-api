@@ -1,0 +1,29 @@
+# Binaries & build outputs
+nfchecker
+server
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test artifacts
+*.out
+*.test
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# Temporary files & archives
+tmp/
+*.tmp
+*.zip
+*.rar
+*.tar.gz
+
+# IDE & OS metadata
+.DS_Store
+.idea/
+.vscode/
+*.swp

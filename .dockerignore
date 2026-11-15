@@ -1,0 +1,25 @@
+# Git & VCS
+.git
+.gitignore
+
+# Documentation
+*.md
+docs/
+
+# Local binaries & build artifacts
+nfchecker
+server
+*.exe
+*.test
+*.out
+
+# Archives & Temporary files
+*.zip
+*.rar
+*.tar.gz
+tmp/
+*.tmp
+
+# Environment files & logs
+.env*
+*.log
