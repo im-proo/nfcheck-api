@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 
@@ -33,7 +34,7 @@ var (
 		Transport: directTransport,
 	}
 	directFTLClient = &http.Client{
-		Timeout: 30 * time.Second,
+		Timeout:   30 * time.Second,
 		Transport: directTransport,
 	}
 )
@@ -60,6 +61,23 @@ func newTransport(px *proxy.Proxy) *http.Transport {
 }
 
 // newHTTPClient returns a client backed by shared or proxy-specific transport.
+// proxyTransports keeps one transport per proxy URL so keep-alive
+// connections are reused instead of a fresh TCP+TLS handshake per check.
+var proxyTransports sync.Map
+
+func transportFor(px *proxy.Proxy) *http.Transport {
+	if px == nil || px.URL == nil {
+		return directTransport
+	}
+	key := px.URL.String()
+	if cached, ok := proxyTransports.Load(key); ok {
+		return cached.(*http.Transport)
+	}
+	built := newTransport(px)
+	actual, _ := proxyTransports.LoadOrStore(key, built)
+	return actual.(*http.Transport)
+}
+
 func newHTTPClient(px *proxy.Proxy, timeoutSec int) *http.Client {
 	if px == nil || px.URL == nil {
 		if timeoutSec == 30 {
@@ -72,7 +90,7 @@ func newHTTPClient(px *proxy.Proxy, timeoutSec int) *http.Client {
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
 			return http.ErrUseLastResponse // manual redirect handling
 		},
-		Transport: newTransport(px),
+		Transport: transportFor(px),
 	}
 }
 
@@ -299,8 +317,8 @@ var (
 	reExtraMember = regexSet{
 		regexp.MustCompile(`"showExtraMemberSection"\s*:\s*(true|false)`),
 	}
-	reProfiles = regexp.MustCompile(`"profileName"\s*:\s*"([^"]+)"`)
-	reExtraAlt = regexp.MustCompile(`(?i)extra\s+on\s+someone.?else.?s\s+plan`)
+	reProfiles  = regexp.MustCompile(`"profileName"\s*:\s*"([^"]+)"`)
+	reExtraAlt  = regexp.MustCompile(`(?i)extra\s+on\s+someone.?else.?s\s+plan`)
 	reIsAdsPlan = regexp.MustCompile(`(?i)(standard with ads|basic with ads|ads-supported)`)
 )
 

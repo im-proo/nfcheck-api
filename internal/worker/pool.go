@@ -164,6 +164,9 @@ func (p *Pool) Run(ctx context.Context, cookies []*models.CookieSet, job *models
 				// Record check for lock-free RPM calculation
 				p.recordCheck()
 				job.IncrChecked()
+				if result.DurationMs > 0 {
+					job.RecordCheckDuration(result.DurationMs)
+				}
 
 				switch result.Status {
 				case "hit":
@@ -273,7 +276,9 @@ func (p *Pool) checkWithRetry(ctx context.Context, cs *models.CookieSet) *models
 		lastErr = fmt.Errorf("%s", result.Error)
 		lastResult = result
 
-		if !p.cfg.RetryOnProxy || p.cfg.ProxyPool == nil {
+		// Retry transient failures even on the direct path: without a proxy
+		// pool a single Netflix hiccup used to be reported as a hard error.
+		if !p.cfg.RetryOnProxy {
 			break
 		}
 

@@ -175,6 +175,21 @@ func (j *JobStatus) SetDone() {
 	defer j.Mu.Unlock()
 	j.Status = "done"
 	j.CompletedAt = time.Now()
+	j.CurrentRPM = 0 // a finished job has no live speed to report
+}
+
+// RecordCheckDuration folds one check into the published average.
+func (j *JobStatus) RecordCheckDuration(ms int64) {
+	if ms <= 0 {
+		return
+	}
+	j.Mu.Lock()
+	if j.AvgCheckMs == 0 {
+		j.AvgCheckMs = ms
+	} else {
+		j.AvgCheckMs = (j.AvgCheckMs*7 + ms) / 8
+	}
+	j.Mu.Unlock()
 }
 
 func (j *JobStatus) SetCancelled() {
@@ -182,6 +197,7 @@ func (j *JobStatus) SetCancelled() {
 	defer j.Mu.Unlock()
 	j.Status = "cancelled"
 	j.CompletedAt = time.Now()
+	j.CurrentRPM = 0
 }
 
 func (j *JobStatus) SetFailed() {
