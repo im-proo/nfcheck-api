@@ -103,6 +103,7 @@ func (s *Server) handleSubmitJob(w http.ResponseWriter, r *http.Request) {
 	ct := r.Header.Get("Content-Type")
 
 	var cookies []*models.CookieSet
+	uploadedName := ""
 	concurrency := s.defaultConcurrency
 	ratePerMin := s.defaultRatePerMinute
 	retryProxy := true
@@ -130,6 +131,7 @@ func (s *Server) handleSubmitJob(w http.ResponseWriter, r *http.Request) {
 			writeError(w, 400, "file read error: "+err.Error())
 			return
 		}
+		uploadedName = fname
 		cookies, err = cookiefetch.ExtractFromReader(fname, data)
 		if err != nil {
 			writeError(w, 400, "cookie extract error: "+err.Error())
@@ -159,7 +161,10 @@ func (s *Server) handleSubmitJob(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if len(cookies) == 0 {
-		writeError(w, 400, "no valid cookies found in input")
+		// Say what was actually read: "0 cookies" alone is useless when the
+		// upload parsed but nothing in it looked like a Netflix session.
+		detail := fmt.Sprintf("no Netflix cookies found in %q", uploadedName)
+		writeError(w, 400, detail)
 		return
 	}
 

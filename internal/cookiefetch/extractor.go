@@ -6,6 +6,7 @@ import (
 	"archive/zip"
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
@@ -20,8 +21,8 @@ import (
 )
 
 const (
-	maxZipFiles            = 50000
-	maxZipFileSize         = 64 * 1024 * 1024  // 64MB per file
+	maxZipFiles             = 50000
+	maxZipFileSize          = 64 * 1024 * 1024  // 64MB per file
 	maxZipTotalUncompressed = 512 * 1024 * 1024 // 512MB total
 )
 
@@ -48,6 +49,19 @@ func ExtractFromReader(name string, data []byte) ([]*models.CookieSet, error) {
 }
 
 func extractFromBytes(name string, data []byte) ([]*models.CookieSet, error) {
+	// Trust the bytes before the extension: exports get renamed, and a .txt
+	// that is really a zip (or the reverse) used to yield zero cookies.
+	switch {
+	case len(data) >= 4 && data[0] == 'P' && data[1] == 'K' && (data[2] == 3 || data[2] == 5):
+		return extractZip(data)
+	case len(data) >= 7 && string(data[:7]) == "Rar!\x1a\x07\x00":
+		return extractRar(data)
+	case len(data) >= 2 && data[0] == 0x1f && data[1] == 0x8b:
+		if plain, err := gunzip(data); err == nil {
+			return extractText(name, plain)
+		}
+	}
+
 	ext := strings.ToLower(filepath.Ext(name))
 	switch ext {
 	case ".zip":
@@ -57,6 +71,33 @@ func extractFromBytes(name string, data []byte) ([]*models.CookieSet, error) {
 	default:
 		return extractText(name, data)
 	}
+}
+
+// gunzip expands a gzip stream so .gz cookie exports are understood too.
+func gunzip(data []byte) ([]byte, error) {
+	zr, err := gzip.NewReader(bytes.NewReader(data))
+	if err != nil {
+		return nil, err
+	}
+	defer zr.Close()
+	return io.ReadAll(io.LimitReader(zr, maxZipFileSize))
+}
+
+// cookieLine trims a Netscape line and drops the "#HttpOnly_" marker Chrome
+// and Edge put in front of HttpOnly cookies. NetflixId and SecureNetflixId are
+// both HttpOnly, so treating those lines as comments hid every real cookie.
+func cookieLine(raw string) (string, bool) {
+	line := strings.TrimSpace(raw)
+	if line == "" {
+		return "", false
+	}
+	if strings.HasPrefix(line, "#HttpOnly_") {
+		return strings.TrimSpace(strings.TrimPrefix(line, "#HttpOnly_")), true
+	}
+	if strings.HasPrefix(line, "#") {
+		return "", false
+	}
+	return line, true
 }
 
 func extractFromDir(dir string) ([]*models.CookieSet, error) {
@@ -284,21 +325,35 @@ func tryNetscape(data []byte) []*models.CookieSet {
 
 	scanner := bufio.NewScanner(bytes.NewReader(data))
 	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
+		line, ok := cookieLine(scanner.Text())
+		if !ok {
 			continue
 		}
 		parts := strings.Split(line, "\t")
-		if len(parts) < 7 {
-			// Try space-delimited
+		if len(parts) < 2 {
 			parts = strings.Fields(line)
-			if len(parts) < 7 {
+			if len(parts) < 2 {
 				continue
 			}
 		}
 
-		name := parts[5]
-		value := parts[6]
+		var name, value string
+		switch {
+		case len(parts) >= 7:
+			// domain, flag, path, secure, expiry, name, value
+			name, value = parts[5], strings.Join(parts[6:], "\t")
+		case len(parts) == 6:
+			// value, domain, path, expiry, name, value-less export
+			name, value = parts[4], parts[5]
+		default:
+			// plain "name<TAB>value" pairs
+			name, value = parts[0], strings.Join(parts[1:], "\t")
+		}
+		name = strings.TrimSpace(name)
+		value = strings.TrimSpace(value)
+		if name == "" || value == "" {
+			continue
+		}
 
 		if name == "NetflixId" && currentMap["NetflixId"] != "" {
 			if cs := cookieMapToSet(currentMap); cs != nil {
@@ -312,8 +367,10 @@ func tryNetscape(data []byte) []*models.CookieSet {
 		}
 
 		currentMap[name] = value
-		if name == "NetflixId" {
-			fmt.Sscanf(parts[4], "%d", &currentExpires)
+		if name == "NetflixId" && len(parts) >= 5 {
+			var expiry int64
+			fmt.Sscanf(strings.TrimSpace(parts[len(parts)-3]), "%d", &expiry)
+			currentExpires = expiry
 		}
 	}
 
@@ -336,8 +393,8 @@ func tryMultiLineRaw(data []byte) []*models.CookieSet {
 	scanner := bufio.NewScanner(bytes.NewReader(data))
 
 	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
+		line, ok := cookieLine(scanner.Text())
+		if !ok {
 			continue
 		}
 
