@@ -41,9 +41,9 @@ EXPOSE 8080
 # RATE_PER_MIN: Rate limit per minute (0 = unlimited, default = 1000)
 # JSON_LOG: Structured JSON logging (true/false)
 ENV PORT=8080 \
-    WORKERS=4 \
-    RATE_PER_MIN=1000 \
-    JSON_LOG=false
+    WORKERS=300 \
+    RATE_PER_MIN=0 \
+    JSON_LOG=true
 
 # Direct exec invocation enables PID 1 signal forwarding for clean SIGTERM graceful shutdown
 ENTRYPOINT ["./nfchecker"]
