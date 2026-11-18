@@ -17,6 +17,15 @@ import (
 	"github.com/nfchecker/internal/api"
 )
 
+// Built-in defaults: no environment is required to run the server. It
+// starts with 300 workers, no rate limit and JSON logs. Every value can
+// still be overridden by a flag or the matching environment variable.
+const (
+	defaultWorkersCount = 300
+	defaultRatePerMin    = 0
+	defaultJSONLog       = true
+)
+
 var (
 	version   = "2.0.0"
 	buildTime = "2026-11-15"
@@ -27,14 +36,14 @@ func main() {
 	defaultWorkersCount := defaultWorkers()
 
 	addr := flag.String("addr", defaultListen, "Listen address (env: PORT or ADDR, default 0.0.0.0:8080)")
-	workers := flag.Int("workers", defaultWorkersCount, "Default worker goroutines (env: WORKERS or CONCURRENCY, default 4)")
+	workers := flag.Int("workers", defaultWorkersCount, "Worker goroutines (env: WORKERS or CONCURRENCY, default 300)")
 	concurrency := flag.Int("concurrency", defaultWorkersCount, "Legacy alias for -workers (env: CONCURRENCY)")
-	ratePerMin := flag.Int("rpm", envInt("RATE_PER_MIN", 1000), "Default checks per minute, 0=unlimited (env: RATE_PER_MIN)")
+	ratePerMin := flag.Int("rpm", envInt("RATE_PER_MIN", defaultRatePerMin), "Checks per minute, 0=unlimited (env: RATE_PER_MIN, default 0)")
 	readTimeout := flag.Duration("read-timeout", 30*time.Second, "HTTP read timeout")
 	writeTimeout := flag.Duration("write-timeout", 120*time.Second, "HTTP write timeout")
 	maxGOMAXPROCS := flag.Int("gomaxprocs", 0, "Override GOMAXPROCS (0 = use all CPUs)")
 	showVersion := flag.Bool("version", false, "Print version and exit")
-	jsonLog := flag.Bool("json-log", envBool("JSON_LOG", false), "Output structured JSON logs")
+	jsonLog := flag.Bool("json-log", envBool("JSON_LOG", defaultJSONLog), "Output structured JSON logs (default on)")
 	flag.Parse()
 
 	if *showVersion {
@@ -127,7 +136,7 @@ func defaultAddr() string {
 }
 
 // defaultWorkers determines the default worker count.
-// It prioritizes WORKERS, falls back to CONCURRENCY, and defaults to 4.
+// It prioritizes WORKERS, falls back to CONCURRENCY, and defaults to 300.
 func defaultWorkers() int {
 	if w := envInt("WORKERS", 0); w > 0 {
 		return w
@@ -135,7 +144,7 @@ func defaultWorkers() int {
 	if c := envInt("CONCURRENCY", 0); c > 0 {
 		return c
 	}
-	return 4
+	return defaultWorkersCount
 }
 
 func envStr(key, def string) string {
