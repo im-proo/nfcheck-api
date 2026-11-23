@@ -139,6 +139,9 @@ type JobStatus struct {
 	Expired    atomic.Int64 `json:"-"`
 	Errors     atomic.Int64 `json:"-"`
 	Duplicates atomic.Int64 `json:"-"`
+	// Hold counts valid sessions whose subscription Netflix has paused:
+	// they keep a plan on the page but cannot stream, so they are not hits.
+	Hold atomic.Int64 `json:"-"`
 
 	// --- mutex-guarded fields ---
 	Mu          sync.Mutex `json:"-"`
@@ -163,6 +166,7 @@ func (j *JobStatus) IncrHits()       { j.Hits.Add(1) }
 func (j *JobStatus) IncrExpired()    { j.Expired.Add(1) }
 func (j *JobStatus) IncrErrors()     { j.Errors.Add(1) }
 func (j *JobStatus) IncrDuplicates() { j.Duplicates.Add(1) }
+func (j *JobStatus) IncrHold()       { j.Hold.Add(1) }
 
 // ---------------------------------------------------------------------------
 // Mutex-guarded setters
@@ -248,6 +252,7 @@ type JobStatusSnapshot struct {
 	Expired         int64   `json:"expired"`
 	Errors          int64   `json:"errors"`
 	Duplicates      int64   `json:"duplicates"`
+	Hold            int64   `json:"hold"`
 	CurrentRPM      float64 `json:"current_rpm"`
 	PeakRPM         float64 `json:"peak_rpm"`
 	Progress        float64 `json:"progress"`
@@ -267,6 +272,7 @@ func (j *JobStatus) Snapshot() JobStatusSnapshot {
 	expired := j.Expired.Load()
 	errors := j.Errors.Load()
 	duplicates := j.Duplicates.Load()
+	hold := j.Hold.Load()
 
 	j.Mu.Lock()
 	status := j.Status
@@ -306,6 +312,7 @@ func (j *JobStatus) Snapshot() JobStatusSnapshot {
 		Expired:         expired,
 		Errors:          errors,
 		Duplicates:      duplicates,
+		Hold:            hold,
 		CurrentRPM:      currentRPM,
 		PeakRPM:         peakRPM,
 		Progress:        progress,

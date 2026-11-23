@@ -174,6 +174,8 @@ func (p *Pool) Run(ctx context.Context, cookies []*models.CookieSet, job *models
 					job.IncrHits()
 				case "expired":
 					job.IncrExpired()
+				case "hold":
+					job.IncrHold()
 				case "error":
 					job.IncrErrors()
 				}
@@ -340,6 +342,19 @@ func processCookie(ctx context.Context, cs *models.CookieSet, px *proxy.Proxy) *
 	switch strings.ToUpper(strings.TrimSpace(acct.MembershipStatus)) {
 	case "FORMER_MEMBER", "NEVER_MEMBER":
 		res.Status = "expired"
+		if px != nil {
+			res.ProxyUsed = px.Raw
+		}
+		return res
+	}
+
+	// A paused subscription still renders its plan, so a held account used
+	// to look exactly like a live Premium one. Netflix can bill it again,
+	// but until then nothing plays on it, so it must not be handed out as a
+	// hit.
+	if acct.IsOnHold {
+		res.Status = "hold"
+		res.Account = acct
 		if px != nil {
 			res.ProxyUsed = px.Raw
 		}
