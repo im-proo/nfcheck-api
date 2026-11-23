@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"fmt"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -332,6 +333,18 @@ func processCookie(ctx context.Context, cs *models.CookieSet, px *proxy.Proxy) *
 
 	// Step 2: Extract rich account info
 	acct := checker.ExtractAccountInfo(vr.PageBody, cs)
+
+	// A cookie can still open the membership page for a closed account, and
+	// those accounts have no plan and no billing. Counting them as hits is
+	// what made former / never-subscribed logins look like valid accounts.
+	switch strings.ToUpper(strings.TrimSpace(acct.MembershipStatus)) {
+	case "FORMER_MEMBER", "NEVER_MEMBER":
+		res.Status = "expired"
+		if px != nil {
+			res.ProxyUsed = px.Raw
+		}
+		return res
+	}
 
 	// Step 3: Fetch nftoken auto-login link
 	nft, err := checker.FetchNfToken(ctx, cs, px)

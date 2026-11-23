@@ -252,8 +252,22 @@ var (
 		regexp.MustCompile(`"MemberPlan"[\s\S]*?"localizedPlanName"\s*:\s*\{\s*"fieldType"\s*:\s*"String"\s*,\s*"value"\s*:\s*"([^"]+)"`),
 		regexp.MustCompile(`localizedPlanName\\\":{\\\"fieldType\\\":\\\"String\\\",\\\"value\\\":\\\"([^"]+)`),
 		regexp.MustCompile(`"localizedPlanName"\s*:\s*"([^"]+)"`),
+		// Some markets order the localizedPlanName / planName object
+		// differently, so the value can sit anywhere inside it.
+		regexp.MustCompile(`"localizedPlanName"[\s\S]{0,160}?"value"\s*:\s*"([^"]+)"`),
+		regexp.MustCompile(`"planName"[\s\S]{0,160}?"value"\s*:\s*"([^"]+)"`),
 		regexp.MustCompile(`"planName"\s*:\s*"([^"]+)"`),
 		regexp.MustCompile(`"currentPlan"[\s\S]{0,200}"name"\s*:\s*"([^"]+)"`),
+		regexp.MustCompile(`"currentPlan"[\s\S]{0,300}?"localizedPlanName"[\s\S]{0,160}?"value"\s*:\s*"([^"]+)"`),
+	}
+	// rePlanCode is locale independent: the tier's machine name, used when
+	// the localised display name is missing or worded in an unknown language.
+	rePlanCode = regexSet{
+		regexp.MustCompile(`"planCode"\s*:\s*"([^"]+)"`),
+		regexp.MustCompile(`"currentPlanCode"\s*:\s*"([^"]+)"`),
+		regexp.MustCompile(`"planId"\s*:\s*"([^"]+)"`),
+		regexp.MustCompile(`"currentPlanId"\s*:\s*"([^"]+)"`),
+		regexp.MustCompile(`"planType"\s*:\s*"([^"]+)"`),
 	}
 	reMemberSince = regexSet{
 		regexp.MustCompile(`"memberSince"\s*:\s*"([^"]+)"`),
@@ -289,7 +303,19 @@ var (
 		regexp.MustCompile(`"formattedPrice"\s*:\s*"([^"]+)"`),
 		regexp.MustCompile(`"planPriceDisplay"\s*:\s*"([^"]+)"`),
 		regexp.MustCompile(`"displayPrice"\s*:\s*"([^"]+)"`),
+		// Markets that bill in a currency usually send the amount and the
+		// currency code separately; the key names differ by locale.
+		regexp.MustCompile(`"priceAmount"\s*:\s*"([^"]+)"`),
+		regexp.MustCompile(`"formattedAmount"\s*:\s*"([^"]+)"`),
+		regexp.MustCompile(`"priceString"\s*:\s*"([^"]+)"`),
+		regexp.MustCompile(`"planPrice"\s*:\s*"([^"]+)"`),
 		regexp.MustCompile(`"price"\s*:\s*\{\s*"fieldType"\s*:\s*"String"\s*,\s*"value"\s*:\s*"([^"]+)"`),
+	}
+	reCurrency = regexSet{
+		regexp.MustCompile(`"currencyCode"\s*:\s*"([^"]+)"`),
+		regexp.MustCompile(`"planCurrency"\s*:\s*"([^"]+)"`),
+		regexp.MustCompile(`"localCurrency"\s*:\s*"([^"]+)"`),
+		regexp.MustCompile(`"currency"\s*:\s*"([A-Za-z]{2,3})"`),
 	}
 	reQuality = regexSet{
 		regexp.MustCompile(`videoQuality"\s*:\s*\{\s*"fieldType"\s*:\s*"String"\s*,\s*"value"\s*:\s*"([^"]+)"`),
@@ -322,6 +348,67 @@ var (
 	reIsAdsPlan = regexp.MustCompile(`(?i)(standard with ads|basic with ads|ads-supported)`)
 )
 
+// planNameAliases folds Netflix's localised plan names into the English
+// tokens the classifier below understands, so a pt-BR "Padrão com anúncios"
+// or an es-ES "Estándar con anuncios" is classified instead of "unknown".
+var planNameAliases = []struct{ from, to string }{
+	{"padrão", "standard"}, {"padrao", "standard"},
+	{"estándar", "standard"}, {"estandar", "standard"},
+	{"standart", "standard"}, {"standaard", "standard"},
+	{"standardowy", "standard"}, {"стандарт", "standard"},
+	{"スタンダード", "standard"}, {"스탠다드", "standard"},
+	{"标准", "standard"}, {"標準", "standard"},
+	{"básico", "basic"}, {"basico", "basic"}, {"basique", "basic"},
+	{"basis", "basic"}, {"podstawowy", "basic"}, {"базовый", "basic"},
+	{"ベーシック", "basic"}, {"기본", "basic"},
+	{"基础", "basic"}, {"基礎", "basic"},
+	{"premium", "premium"}, {"premiun", "premium"}, {"prémium", "premium"},
+	{"премиум", "premium"}, {"преміум", "premium"}, {"премијум", "premium"},
+	{"بريميوم", "premium"}, {"پرمیوم", "premium"},
+	{"プレミアム", "premium"}, {"프리미엄", "premium"},
+	{"高级", "premium"}, {"高級", "premium"},
+	// Turkish ("Özel") and Vietnamese ("Cao cấp") name Premium with their own
+	// words, and Hindi / Thai use native scripts.
+	{"özel", "premium"}, {"cao cấp", "premium"},
+	{"प्रीमियम", "premium"}, {"พรีเมียม", "premium"},
+	{"anúncios", "ads"}, {"anuncios", "ads"}, {"anoncios", "ads"},
+	{"anúncio", "ads"}, {"anuncio", "ads"},
+	{"publicidad", "ads"}, {"pubblicità", "ads"}, {"pubblicita", "ads"},
+	{"werbung", "ads"}, {"avec pub", "ads"}, {"met reclame", "ads"},
+	{"reklam", "ads"}, {"광고", "ads"}, {"広告", "ads"},
+	{"广告", "ads"}, {"廣告", "ads"}, {"реклам", "ads"}, {"إعلان", "ads"},
+	{"standar", "standard"}, {"tiêu chuẩn", "standard"}, {"tieu chuan", "standard"},
+	{"סטנדרטי", "standard"}, {"قياسي", "standard"}, {"मानक", "standard"},
+	{"มาตรฐาน", "standard"},
+	{"dasar", "basic"}, {"temel", "basic"}, {"cơ bản", "basic"}, {"co ban", "basic"},
+	{"בסיסי", "basic"}, {"أساسي", "basic"}, {"बेसिक", "basic"}, {"พื้นฐาน", "basic"},
+	{"alap", "basic"}, {"základní", "basic"}, {"zakladni", "basic"}, {"perus", "basic"},
+	{"premijum", "premium"}, {"פרימיום", "premium"},
+	{"publicit", "ads"}, {"publicité", "ads"}, {"pubblicità", "ads"},
+	{"annonce", "ads"}, {"annonces", "ads"}, {"annonser", "ads"}, {"annoncer", "ads"},
+	{"iklan", "ads"}, {"reklamami", "ads"}, {"reklamları", "ads"}, {"reklamli", "ads"},
+	{"oglas", "ads"}, {"oglasima", "ads"}, {"hirdetés", "ads"}, {"hirdetes", "ads"},
+	{"โฆษณา", "ads"}, {"פרסומות", "ads"}, {"إعلانات", "ads"},
+}
+
+// normalizePlanName returns the lower-cased plan name with an English
+// canonical token appended for every localised word it contains.
+func normalizePlanName(plan string) string {
+	lower := strings.ToLower(strings.TrimSpace(plan))
+	if lower == "" {
+		return lower
+	}
+	var b strings.Builder
+	b.WriteString(lower)
+	for _, alias := range planNameAliases {
+		if strings.Contains(lower, alias.from) {
+			b.WriteString(" ")
+			b.WriteString(alias.to)
+		}
+	}
+	return b.String()
+}
+
 // ExtractAccountInfo parses account details from the membership page HTML.
 func ExtractAccountInfo(page string, cs *models.CookieSet) *models.AccountInfo {
 	info := &models.AccountInfo{}
@@ -331,6 +418,7 @@ func ExtractAccountInfo(page string, cs *models.CookieSet) *models.AccountInfo {
 	info.Country = reCountry.find(page)
 	info.CountryFlag = countryFlag(info.Country)
 	info.Plan = rePlan.find(page)
+	info.PlanCode = rePlanCode.find(page)
 	info.MemberSince = reMemberSince.find(page)
 	info.NextBilling = reNextBilling.find(page)
 	info.Payment = rePayment.find(page)
@@ -343,6 +431,10 @@ func ExtractAccountInfo(page string, cs *models.CookieSet) *models.AccountInfo {
 		info.Phone = "None"
 	}
 	info.Price = rePrice.find(page)
+	info.Currency = reCurrency.find(page)
+	if info.Currency == "Unknown" {
+		info.Currency = ""
+	}
 	info.VideoQuality = reQuality.find(page)
 	info.UserGUID = reGUID.find(page)
 	info.MembershipStatus = reMembership.find(page)
@@ -365,9 +457,12 @@ func ExtractAccountInfo(page string, cs *models.CookieSet) *models.AccountInfo {
 		}
 	}
 
-	// Plan type classification (accuracy improvements)
+	// Plan type classification (accuracy improvements). The plan code is
+	// appended so a localised name the alias table does not know still
+	// falls back to the tier's machine-readable value instead of "unknown".
 	info.IsOnHold = info.HoldStatus == "Yes"
-	planLower := strings.ToLower(info.Plan)
+	classifySource := strings.TrimSpace(info.Plan + " " + info.PlanCode)
+	planLower := normalizePlanName(classifySource)
 	switch {
 	case strings.Contains(planLower, "premium"):
 		info.PlanType = "premium"

@@ -24,19 +24,26 @@ type CookieSet struct {
 
 // AccountInfo is the fully-extracted Netflix account data.
 type AccountInfo struct {
-	Name             string   `json:"name"`
-	Email            string   `json:"email"`
-	Country          string   `json:"country"`
-	CountryFlag      string   `json:"country_flag"`
-	Plan             string   `json:"plan"`
-	MemberSince      string   `json:"member_since"`
-	NextBilling      string   `json:"next_billing"`
-	Payment          string   `json:"payment"`
-	Card             string   `json:"card"`
-	Phone            string   `json:"phone"`
-	VideoQuality     string   `json:"video_quality"`
-	Streams          int      `json:"streams"`
-	Price            string   `json:"price"`
+	Name        string `json:"name"`
+	Email       string `json:"email"`
+	Country     string `json:"country"`
+	CountryFlag string `json:"country_flag"`
+	Plan        string `json:"plan"`
+	// PlanCode is the locale-independent tier the page exposes ("PREMIUM",
+	// "STANDARD"…). It classifies an account whose localised name is one the
+	// alias table does not know.
+	PlanCode     string `json:"plan_code,omitempty"`
+	MemberSince  string `json:"member_since"`
+	NextBilling  string `json:"next_billing"`
+	Payment      string `json:"payment"`
+	Card         string `json:"card"`
+	Phone        string `json:"phone"`
+	VideoQuality string `json:"video_quality"`
+	Streams      int    `json:"streams"`
+	Price        string `json:"price"`
+	// Currency is the ISO code of the market's billing currency ("TRY",
+	// "BRL"…), so a price rendered as a bare number still reads right.
+	Currency         string   `json:"currency"`
 	HoldStatus       string   `json:"hold_status"`
 	ExtraMember      string   `json:"extra_member"`
 	EmailVerified    string   `json:"email_verified"`
