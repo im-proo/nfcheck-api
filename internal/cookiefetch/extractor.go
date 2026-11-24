@@ -202,23 +202,51 @@ func extractText(name string, data []byte) ([]*models.CookieSet, error) {
 		return nil, nil
 	}
 
-	// 1. Try JSON Array of cookies or sessions
-	if sets, ok := tryJSONArray(trimmed); ok && len(sets) > 0 {
-		return sets, nil
+	// Every parser runs and the results are merged. Returning after the first
+	// parser that matched anything used to leave the rest of a mixed export
+	// unchecked, which looked like the checker skipping part of the file.
+	var sets []*models.CookieSet
+	if found, ok := tryJSONArray(trimmed); ok {
+		sets = append(sets, found...)
 	}
-
-	// 2. Try single JSON object
 	if cs, ok := trySingleJSON(trimmed); ok {
-		return []*models.CookieSet{cs}, nil
+		sets = append(sets, cs)
 	}
+	sets = append(sets, tryNetscape(trimmed)...)
+	sets = append(sets, tryMultiLineRaw(trimmed)...)
+	return dedupeSets(sets), nil
+}
 
-	// 3. Try Netscape format
-	if sets := tryNetscape(trimmed); len(sets) > 0 {
-		return sets, nil
+// dedupeSets drops a cookie seen twice, keeping the order of first sight.
+func dedupeSets(sets []*models.CookieSet) []*models.CookieSet {
+	if len(sets) < 2 {
+		return sets
 	}
+	seen := make(map[string]bool, len(sets))
+	out := sets[:0]
+	for _, cs := range sets {
+		if cs == nil || cs.NetflixId == "" {
+			continue
+		}
+		if cs.Fingerprint == "" {
+			fingerprint(cs)
+		}
+		if seen[cs.Fingerprint] {
+			continue
+		}
+		seen[cs.Fingerprint] = true
+		out = append(out, cs)
+	}
+	return out
+}
 
-	// 4. Try multi-line raw cookies / strings
-	return tryMultiLineRaw(trimmed), nil
+// newLineScanner reads lines of any realistic length. bufio.Scanner's 64KB
+// default ended the scan silently in the middle of a long export, so the rest
+// of the file was never parsed and never checked.
+func newLineScanner(r io.Reader) *bufio.Scanner {
+	scanner := bufio.NewScanner(r)
+	scanner.Buffer(make([]byte, 0, 64*1024), 32*1024*1024)
+	return scanner
 }
 
 func tryJSONArray(data []byte) ([]*models.CookieSet, bool) {
@@ -323,7 +351,8 @@ func tryNetscape(data []byte) []*models.CookieSet {
 	currentMap := make(map[string]string)
 	var currentExpires int64
 
-	scanner := bufio.NewScanner(bytes.NewReader(data))
+	scanner := newLineScanner(bytes.NewReader(data))
+	hasNetflixId := false
 	for scanner.Scan() {
 		line, ok := cookieLine(scanner.Text())
 		if !ok {
@@ -355,7 +384,10 @@ func tryNetscape(data []byte) []*models.CookieSet {
 			continue
 		}
 
-		if name == "NetflixId" && currentMap["NetflixId"] != "" {
+		// A new NetflixId starts a new session whatever case the export used:
+		// a lower-cased "netflixid" used to keep overwriting the same slot, so
+		// a whole file produced one cookie instead of all of them.
+		if strings.EqualFold(name, "NetflixId") && hasNetflixId {
 			if cs := cookieMapToSet(currentMap); cs != nil {
 				if currentExpires > 0 {
 					cs.CookieExpires = currentExpires
@@ -364,10 +396,14 @@ func tryNetscape(data []byte) []*models.CookieSet {
 			}
 			currentMap = make(map[string]string)
 			currentExpires = 0
+			hasNetflixId = false
 		}
 
 		currentMap[name] = value
-		if name == "NetflixId" && len(parts) >= 5 {
+		if strings.EqualFold(name, "NetflixId") {
+			hasNetflixId = true
+		}
+		if strings.EqualFold(name, "NetflixId") && len(parts) >= 5 {
 			var expiry int64
 			fmt.Sscanf(strings.TrimSpace(parts[len(parts)-3]), "%d", &expiry)
 			currentExpires = expiry
@@ -390,7 +426,7 @@ func tryNetscape(data []byte) []*models.CookieSet {
 // semicolon-delimited cookie strings, or raw ct%3D tokens).
 func tryMultiLineRaw(data []byte) []*models.CookieSet {
 	var sets []*models.CookieSet
-	scanner := bufio.NewScanner(bytes.NewReader(data))
+	scanner := newLineScanner(bytes.NewReader(data))
 
 	for scanner.Scan() {
 		line, ok := cookieLine(scanner.Text())

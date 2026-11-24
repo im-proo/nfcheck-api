@@ -84,6 +84,9 @@ type CheckResult struct {
 	ProxyUsed  string       `json:"proxy_used,omitempty"`
 	CheckedAt  time.Time    `json:"checked_at"`
 	DurationMs int64        `json:"duration_ms"`
+	// RetryAfterMs is the edge's own back-off hint (Retry-After on 429/503),
+	// so a rate-limited run waits instead of hammering the same IP.
+	RetryAfterMs int64 `json:"-"`
 }
 
 // checkResultPool reduces GC pressure by reusing CheckResult allocations.

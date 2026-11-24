@@ -143,9 +143,8 @@ func (s *Server) handleSubmitJob(w http.ResponseWriter, r *http.Request) {
 			Cookies       []*models.CookieSet `json:"cookies"`
 			Concurrency   int                 `json:"concurrency"`
 			RatePerMinute int                 `json:"rate_per_minute"`
-			RetryProxy    bool                `json:"retry_on_proxy"`
+			RetryProxy    *bool               `json:"retry_on_proxy"`
 		}
-		req.RetryProxy = true
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeError(w, 400, "JSON decode error: "+err.Error())
 			return
@@ -157,8 +156,14 @@ func (s *Server) handleSubmitJob(w http.ResponseWriter, r *http.Request) {
 		if req.RatePerMinute != 0 {
 			ratePerMin = req.RatePerMinute
 		}
-		retryProxy = req.RetryProxy
+		if req.RetryProxy != nil {
+			retryProxy = *req.RetryProxy
+		}
 	}
+
+	// Log what was parsed next to the upload name, so a file that yields fewer
+	// cookies than it holds is visible in the API log instead of silent.
+	slog.Info("cookie file parsed", "file", uploadedName, "cookies", len(cookies))
 
 	if len(cookies) == 0 {
 		// Say what was actually read: "0 cookies" alone is useless when the

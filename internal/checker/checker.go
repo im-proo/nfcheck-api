@@ -11,8 +11,10 @@ import (
 	"net/http"
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode"
 
@@ -100,13 +102,94 @@ func newHTTPClient(px *proxy.Proxy, timeoutSec int) *http.Client {
 
 const membershipURL = "https://www.netflix.com/account/membership"
 
-var webUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+// webUAs is rotated per request. One frozen User-Agent across thousands of
+// checks from the same address is an easy bot signal, and the edge answers it
+// with 403/429 pages that used to land in a run as hard errors.
+var webUAs = []string{
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36",
+	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+	"Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.1 Safari/605.1.15",
+	"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36 Edg/131.0.0.0",
+	"Mozilla/5.0 (X11; Linux x86_64; rv:133.0) Gecko/20100101 Firefox/133.0",
+}
+
+var acceptLanguages = []string{
+	"en-US,en;q=0.9",
+	"en-US,en;q=0.9,es;q=0.8",
+	"en-GB,en;q=0.9",
+	"en-US,en;q=0.8,fr;q=0.6",
+	"en-US,en;q=0.9,de;q=0.8",
+}
+
+var browserRotation uint64
+
+func nextBrowser() (string, string) {
+	i := atomic.AddUint64(&browserRotation, 1)
+	return webUAs[int(i)%len(webUAs)], acceptLanguages[int(i)%len(acceptLanguages)]
+}
+
+// applyBrowserHeaders makes the membership request look like a real browser
+// navigation. The Sec-Fetch / Upgrade-Insecure-Requests headers are what a
+// bare Go request omits first, and their absence is a cheap way to spot a bot.
+func applyBrowserHeaders(req *http.Request) {
+	ua, lang := nextBrowser()
+	req.Header.Set("User-Agent", ua)
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
+	req.Header.Set("Accept-Language", lang)
+	req.Header.Set("Accept-Encoding", "identity")
+	req.Header.Set("Upgrade-Insecure-Requests", "1")
+	req.Header.Set("Sec-Fetch-Dest", "document")
+	req.Header.Set("Sec-Fetch-Mode", "navigate")
+	req.Header.Set("Sec-Fetch-Site", "none")
+	req.Header.Set("Sec-Fetch-User", "?1")
+	req.Header.Set("Cache-Control", "max-age=0")
+}
+
+// HTTPStatusError keeps the status code so the worker can tell a rate limit
+// apart from a dead cookie and retry with a real delay.
+type HTTPStatusError struct {
+	Code       int
+	RetryAfter time.Duration
+}
+
+func (e *HTTPStatusError) Error() string {
+	if e.RetryAfter > 0 {
+		return fmt.Sprintf("status %d (retry after %s)", e.Code, e.RetryAfter)
+	}
+	return fmt.Sprintf("status %d", e.Code)
+}
+
+// transientStatus reports whether the edge refused the request rather than
+// the cookie being invalid. Those are worth another attempt.
+func transientStatus(code int) bool {
+	switch code {
+	case 408, 425, 429, 500, 502, 503, 504, 520, 521, 522, 523, 524:
+		return true
+	}
+	return false
+}
+
+func newStatusError(resp *http.Response) *HTTPStatusError {
+	err := &HTTPStatusError{Code: resp.StatusCode}
+	if err.Code == 429 || err.Code == 503 {
+		raw := strings.TrimSpace(resp.Header.Get("Retry-After"))
+		if seconds, convErr := strconv.Atoi(raw); convErr == nil && seconds > 0 {
+			if seconds > 10 {
+				seconds = 10
+			}
+			err.RetryAfter = time.Duration(seconds) * time.Second
+		}
+	}
+	return err
+}
 
 // ValidateResult is returned from Step 1.
 type ValidateResult struct {
-	Valid    bool
-	PageBody string
-	Err      error
+	Valid      bool
+	PageBody   string
+	Err        error
+	RetryAfter time.Duration
 }
 
 // ValidateSession checks whether the cookie is still valid by hitting the
@@ -119,11 +202,7 @@ func ValidateSession(ctx context.Context, cs *models.CookieSet, px *proxy.Proxy)
 		return &ValidateResult{Err: err}
 	}
 
-	req.Header.Set("User-Agent", webUA)
-	req.Header.Set("Accept-Encoding", "identity")
-	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8")
-	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
-
+	applyBrowserHeaders(req)
 	setCookies(req, cs)
 
 	resp, err := client.Do(req)
@@ -155,8 +234,7 @@ func ValidateSession(ctx context.Context, cs *models.CookieSet, px *proxy.Proxy)
 		if err2 != nil {
 			return &ValidateResult{Err: err2}
 		}
-		req2.Header.Set("User-Agent", webUA)
-		req2.Header.Set("Accept-Encoding", "identity")
+		applyBrowserHeaders(req2)
 		setCookies(req2, cs)
 		resp2, err2 := client.Do(req2)
 		if err2 != nil {
@@ -172,7 +250,12 @@ func ValidateSession(ctx context.Context, cs *models.CookieSet, px *proxy.Proxy)
 		return &ValidateResult{Valid: false}
 	}
 	if resp.StatusCode != 200 {
-		return &ValidateResult{Valid: false, Err: fmt.Errorf("status %d", resp.StatusCode)}
+		statusErr := newStatusError(resp)
+		if transientStatus(resp.StatusCode) {
+			// Retryable: the edge refused us, the cookie may still be valid.
+			return &ValidateResult{Err: statusErr, RetryAfter: statusErr.RetryAfter}
+		}
+		return &ValidateResult{Valid: false, Err: statusErr}
 	}
 
 	body, err := readBodyLimited(resp, 4*1024*1024) // 4MB limit

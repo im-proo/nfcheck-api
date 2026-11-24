@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
+	"math/rand"
 	"runtime"
 	"strings"
 	"sync"
@@ -33,7 +34,9 @@ func (c *Config) defaults() {
 		c.Concurrency = 100
 	}
 	if c.MaxRetries <= 0 {
-		c.MaxRetries = 2
+		// One retry is not enough against a rate-limiting edge: 429s used to
+		// be reported as dead cookies after two quick attempts.
+		c.MaxRetries = 3
 	}
 	if c.ResultBuffer <= 0 {
 		c.ResultBuffer = 10000
@@ -285,11 +288,16 @@ func (p *Pool) checkWithRetry(ctx context.Context, cs *models.CookieSet) *models
 			break
 		}
 
-		// Exponential backoff with jitter
-		backoff := time.Duration(100*(1<<attempt)) * time.Millisecond
-		if backoff > 1*time.Second {
-			backoff = 1 * time.Second
+		// The edge's own Retry-After wins; otherwise exponential backoff with
+		// jitter, so 50 workers never retry in lockstep against one address.
+		backoff := time.Duration(400*(1<<attempt)) * time.Millisecond
+		if result.RetryAfterMs > 0 {
+			backoff = time.Duration(result.RetryAfterMs) * time.Millisecond
 		}
+		if backoff > 10*time.Second {
+			backoff = 10 * time.Second
+		}
+		backoff += time.Duration(rand.Int63n(300)) * time.Millisecond
 		select {
 		case <-time.After(backoff):
 		case <-ctx.Done():
@@ -320,6 +328,7 @@ func processCookie(ctx context.Context, cs *models.CookieSet, px *proxy.Proxy) *
 	if vr.Err != nil {
 		res.Status = "error"
 		res.Error = vr.Err.Error()
+		res.RetryAfterMs = vr.RetryAfter.Milliseconds()
 		if px != nil {
 			res.ProxyUsed = px.Raw
 		}
