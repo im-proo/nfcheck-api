@@ -21,6 +21,8 @@ import (
 	"github.com/nfchecker/internal/cookiefetch"
 	"github.com/nfchecker/internal/models"
 	"github.com/nfchecker/internal/proxy"
+	"github.com/nfchecker/internal/proxyscan"
+	"github.com/nfchecker/internal/proxysrc"
 	"github.com/nfchecker/internal/worker"
 )
 
@@ -33,6 +35,12 @@ type Server struct {
 	// default worker settings (can be overridden per request)
 	defaultConcurrency   int
 	defaultRatePerMinute int
+
+	// scrapeMu serialises harvests: two jobs asking for proxies at the same
+	// moment must not both sweep the public lists and fight over the tier.
+	scrapeMu       sync.Mutex
+	lastScrape     time.Time
+	lastScrapeNote string
 }
 
 type jobRecord struct {
@@ -76,6 +84,7 @@ func (s *Server) registerRoutes() {
 	v1.HandleFunc("/jobs/{id}/cancel", s.handleCancelJob).Methods("POST")
 	v1.HandleFunc("/proxies", s.handleUpdateProxies).Methods("POST")
 	v1.HandleFunc("/proxies/status", s.handleProxyStatus).Methods("GET")
+	v1.HandleFunc("/proxies/refresh", s.handleRefreshProxies).Methods("POST")
 	v1.HandleFunc("/stats", s.handleStats).Methods("GET")
 
 	// Prometheus Metrics
@@ -495,10 +504,201 @@ func (s *Server) StartProxyReviver(interval, maxAge time.Duration) {
 
 // GET /api/v1/proxies/status
 func (s *Server) handleProxyStatus(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, 200, map[string]interface{}{
-		"total": s.proxyPool.Total(),
-		"alive": s.proxyPool.Alive(),
+	stats := s.proxyPool.Stats()
+	bySource := map[string]int{}
+	for _, px := range stats.Proxies {
+		src := px.Source
+		if src == "" {
+			src = proxy.SourceManual
+		}
+		if px.Alive {
+			bySource[src]++
+		}
+	}
+	body := map[string]interface{}{
+		"total":        stats.Total,
+		"alive":        stats.Alive,
+		"dead":         stats.Dead,
+		"avg_latency":  stats.AvgLatency,
+		"alive_by_src": bySource,
+	}
+	if !s.lastScrape.IsZero() {
+		body["last_scrape"] = s.lastScrape.UTC().Format(time.RFC3339)
+	}
+	writeJSON(w, 200, body)
+}
+
+// -----------------------------------------------------------------
+// POST /api/v1/proxies/refresh
+// Harvests public lists, probes every candidate against Netflix and loads the
+// fastest `target` survivors into the scrape tier. The bot calls this before a
+// job with the count its cookie volume needs; configured (paid) proxies are
+// never touched and always take priority over scraped ones.
+// -----------------------------------------------------------------
+
+// RefreshOptions sizes one harvest.
+type RefreshOptions struct {
+	Target        int
+	MaxCandidates int
+	MaxLatencyMs  int
+	Concurrency   int
+	Sources       []string // source names, empty = every default source
+}
+
+// maxScrapeProxies caps the scrape tier. More than this only adds socket
+// churn: one proxy is meant to carry ~500 cookies, not one cookie.
+const maxScrapeProxies = 64
+
+// scrapeFreshFor is how long a successful harvest is reused before the lists
+// are swept again.
+const scrapeFreshFor = 10 * time.Minute
+
+// RefreshResult is the JSON body of the refresh endpoint.
+type RefreshResult struct {
+	Target         int                   `json:"target"`
+	Candidates     int                   `json:"candidates"`
+	Tested         int                   `json:"tested"`
+	Alive          int                   `json:"alive"`
+	Loaded         int                   `json:"loaded"`
+	Replaced       int                   `json:"replaced"`
+	BestLatencyMs  int                   `json:"best_latency_ms"`
+	WorstLatencyMs int                   `json:"worst_latency_ms"`
+	TookMs         int64                 `json:"took_ms"`
+	ScanMs         int64                 `json:"scan_ms"`
+	Cached         bool                  `json:"cached,omitempty"`
+	Rejected       map[string]int        `json:"rejected,omitempty"`
+	Sources        []proxysrc.SourceStat `json:"sources,omitempty"`
+}
+
+// RefreshProxies runs one harvest+scan and returns what it loaded.
+func (s *Server) RefreshProxies(ctx context.Context, opt RefreshOptions) RefreshResult {
+	if opt.Target <= 0 {
+		opt.Target = 1
+	}
+	if opt.Target > maxScrapeProxies {
+		opt.Target = maxScrapeProxies
+	}
+	if opt.MaxCandidates <= 0 {
+		opt.MaxCandidates = 1500
+	}
+	if opt.Concurrency <= 0 {
+		opt.Concurrency = 300
+	}
+	if opt.MaxLatencyMs <= 0 {
+		opt.MaxLatencyMs = 1500
+	}
+
+	s.scrapeMu.Lock()
+	defer s.scrapeMu.Unlock()
+
+	start := time.Now()
+
+	// A recent harvest with enough live proxies is reused instead of sweeping
+	// the lists again: the scan is the expensive part and the lists rotate
+	// slowly.
+	if alive := s.proxyPool.CountSource(proxy.SourceScrape, true); alive >= opt.Target &&
+		!s.lastScrape.IsZero() && time.Since(s.lastScrape) < scrapeFreshFor {
+		return RefreshResult{Target: opt.Target, Alive: alive, Loaded: alive, Cached: true}
+	}
+
+	sources := proxysrc.DefaultSources()
+	if len(opt.Sources) > 0 {
+		want := make(map[string]struct{}, len(opt.Sources))
+		for _, name := range opt.Sources {
+			want[strings.ToLower(strings.TrimSpace(name))] = struct{}{}
+		}
+		filtered := make([]proxysrc.Source, 0, len(sources))
+		for _, src := range sources {
+			if _, ok := want[strings.ToLower(src.Name)]; ok {
+				filtered = append(filtered, src)
+			}
+		}
+		if len(filtered) == 0 {
+			s.lastScrapeNote = "no such source"
+		}
+		sources = filtered
+	}
+
+	harvest := proxysrc.Harvest(ctx, proxysrc.Options{
+		Sources:      sources,
+		MaxPerSource: opt.MaxCandidates,
 	})
+	candidates := harvest.Candidates
+	if len(candidates) > opt.MaxCandidates {
+		candidates = candidates[:opt.MaxCandidates]
+	}
+
+	scan := proxyscan.Scan(ctx, candidates, proxyscan.Options{
+		Concurrency: opt.Concurrency,
+		MaxLatency:  time.Duration(opt.MaxLatencyMs) * time.Millisecond,
+	})
+
+	load := opt.Target
+	if len(scan.Alive) < load {
+		load = len(scan.Alive)
+	}
+	chosen := make([]*proxy.Proxy, 0, load)
+	for _, hit := range scan.Alive[:load] {
+		hit.Proxy.SetLatency(hit.Latency)
+		chosen = append(chosen, hit.Proxy)
+	}
+	replaced := s.proxyPool.ReplaceSource(proxy.SourceScrape, chosen)
+	s.lastScrape = time.Now()
+	s.lastScrapeNote = ""
+
+	res := RefreshResult{
+		Target:     opt.Target,
+		Candidates: len(candidates),
+		Tested:     scan.Tested,
+		Alive:      len(scan.Alive),
+		Loaded:     len(chosen),
+		Replaced:   replaced,
+		TookMs:     time.Since(start).Milliseconds(),
+		ScanMs:     scan.Duration.Milliseconds(),
+		Rejected:   scan.Rejected,
+		Sources:    harvest.Stats,
+	}
+	if len(scan.Alive) > 0 {
+		res.BestLatencyMs = int(scan.Alive[0].Latency.Milliseconds())
+		res.WorstLatencyMs = int(scan.Alive[len(scan.Alive)-1].Latency.Milliseconds())
+	}
+	return res
+}
+
+func (s *Server) handleRefreshProxies(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Target        int      `json:"target"`
+		MaxCandidates int      `json:"max_candidates"`
+		MaxLatencyMs  int      `json:"max_latency_ms"`
+		Concurrency   int      `json:"concurrency"`
+		Sources       []string `json:"sources"`
+	}
+	// A missing or empty body is fine: every field has a default.
+	if r.Body != nil {
+		_ = json.NewDecoder(io.LimitReader(r.Body, 1<<20)).Decode(&req)
+	}
+
+	ctx, cancel := context.WithTimeout(r.Context(), 120*time.Second)
+	defer cancel()
+
+	res := s.RefreshProxies(ctx, RefreshOptions{
+		Target:        req.Target,
+		MaxCandidates: req.MaxCandidates,
+		MaxLatencyMs:  req.MaxLatencyMs,
+		Concurrency:   req.Concurrency,
+		Sources:       req.Sources,
+	})
+	slog.Info("proxy refresh",
+		"target", res.Target,
+		"candidates", res.Candidates,
+		"tested", res.Tested,
+		"alive", res.Alive,
+		"loaded", res.Loaded,
+		"best_ms", res.BestLatencyMs,
+		"scan_ms", res.ScanMs,
+		"cached", res.Cached,
+	)
+	writeJSON(w, 200, res)
 }
 
 // -----------------------------------------------------------------

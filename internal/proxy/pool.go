@@ -21,9 +21,20 @@ import (
 // Proxy — a single proxy entry with latency and success/failure tracking
 // ---------------------------------------------------------------------------
 
+// Proxy sources. A pool prefers every "manual" proxy (one the operator
+// loaded or paid for) over a scraped one, so automatic harvesting can never
+// silently degrade a setup that already works.
+const (
+	SourceManual = "manual"
+	SourceScrape = "scrape"
+)
+
 // Proxy is a single proxy entry.
 type Proxy struct {
-	Raw    string
+	Raw string
+	// Source is SourceScrape for harvested proxies and either empty or
+	// SourceManual for configured ones.
+	Source string
 	URL    *url.URL
 	Scheme string
 	Host   string
@@ -110,6 +121,7 @@ func (p *Proxy) recordLatency(d time.Duration) {
 // ProxyStats holds per-proxy statistics.
 type ProxyStats struct {
 	Raw          string  `json:"raw"`
+	Source       string  `json:"source,omitempty"`
 	Alive        bool    `json:"alive"`
 	Removed      bool    `json:"removed"`
 	AvgLatencyMs float64 `json:"avg_latency_ms"`
@@ -203,6 +215,67 @@ func (p *Pool) LoadFromString(raw string) LoadReport {
 	return LoadReport{Loaded: len(proxies), Rejected: rejected}
 }
 
+// ReplaceSource swaps every proxy of one source for a fresh list and keeps
+// the other tiers untouched. Used by the harvester: a scan yields a new set of
+// scraped proxies, and the old ones (often already dead) are dropped.
+// Returns how many proxies were replaced.
+func (p *Pool) ReplaceSource(source string, list []*Proxy) int {
+	p.mu.Lock()
+	kept := make([]*Proxy, 0, len(p.proxies)+len(list))
+	replaced := 0
+	for _, px := range p.proxies {
+		if px.Source == source {
+			atomic.StoreUint32(&px.removed, 1)
+			atomic.StoreUint32(&px.Dead, 1)
+			replaced++
+			continue
+		}
+		kept = append(kept, px)
+	}
+	for _, px := range list {
+		if px == nil || px.URL == nil {
+			continue
+		}
+		px.Source = source
+		kept = append(kept, px)
+	}
+	p.proxies = kept
+	p.mu.Unlock()
+
+	p.recountAlive()
+	return replaced
+}
+
+// CountSource counts proxies of one source, live ones only when aliveOnly.
+func (p *Pool) CountSource(source string, aliveOnly bool) int {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	n := 0
+	for _, px := range p.proxies {
+		if px.Source != source {
+			continue
+		}
+		if aliveOnly && !px.IsAlive() {
+			continue
+		}
+		n++
+	}
+	return n
+}
+
+// recountAlive recomputes the O(1) alive counter after a structural change.
+func (p *Pool) recountAlive() {
+	p.mu.RLock()
+	alive := int64(0)
+	for _, px := range p.proxies {
+		if px.IsAlive() {
+			alive++
+		}
+	}
+	p.mu.RUnlock()
+	atomic.StoreInt64(&p.aliveCount, alive)
+}
+
 // Alive returns the number of alive (non-dead, non-removed) proxies.
 // This is O(1) because the count is maintained atomically.
 func (p *Pool) Alive() int {
@@ -230,12 +303,20 @@ func (p *Pool) Next() *Proxy {
 		return nil
 	}
 	start := atomic.AddUint64(&p.cursor, 1)
-	for i := 0; i < n; i++ {
-		idx := (int(start) + i) % n
-		px := p.proxies[idx]
-		if px.IsAlive() {
-			atomic.StoreInt64(&px.LastUsed, time.Now().UnixNano())
-			return px
+	// Two passes: configured proxies first, scraped ones only when no
+	// configured proxy is alive.
+	for pass := 0; pass < 2; pass++ {
+		wantScrape := pass == 1
+		for i := 0; i < n; i++ {
+			idx := (int(start) + i) % n
+			px := p.proxies[idx]
+			if (px.Source == SourceScrape) != wantScrape {
+				continue
+			}
+			if px.IsAlive() {
+				atomic.StoreInt64(&px.LastUsed, time.Now().UnixNano())
+				return px
+			}
 		}
 	}
 	return nil
@@ -415,6 +496,12 @@ func (p *Pool) ReviveDead(maxAge time.Duration) int {
 		if px.isRemoved() {
 			continue
 		}
+		// A scraped proxy that died is replaced by the next harvest, not
+		// revived: free proxies rarely recover, and a revived corpse just
+		// burns checks until it fails again.
+		if px.Source == SourceScrape {
+			continue
+		}
 		if atomic.LoadUint32(&px.Dead) == 0 {
 			continue // already alive
 		}
@@ -472,6 +559,7 @@ func (p *Pool) Stats() PoolStats {
 
 		ps := ProxyStats{
 			Raw:          px.Raw,
+			Source:       px.Source,
 			Alive:        isAlive,
 			Removed:      isRemoved,
 			AvgLatencyMs: px.AvgLatencyMs(),
@@ -541,6 +629,15 @@ func ProxyTransport(px *Proxy) *http.Transport {
 	}
 	return tr
 }
+
+// Parse turns one proxy string into a Proxy, or nil when the line is not a
+// proxy. It is the single entry point shared by the API and the harvester.
+func Parse(raw string) *Proxy { return parseProxy(raw) }
+
+// SetLatency seeds the latency average, used by the scanner for proxies that
+// have not served a check yet. Without it a brand-new pool looks untested and
+// SmartNext cannot rank it.
+func (p *Proxy) SetLatency(d time.Duration) { p.recordLatency(d) }
 
 // -----------------------------------------------------------------
 // Proxy string parser – handles all common formats
