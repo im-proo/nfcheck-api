@@ -137,7 +137,10 @@ func applyBrowserHeaders(req *http.Request) {
 	req.Header.Set("User-Agent", ua)
 	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8")
 	req.Header.Set("Accept-Language", lang)
-	req.Header.Set("Accept-Encoding", "identity")
+	// No explicit Accept-Encoding: the transport then negotiates gzip and
+	// decompresses it transparently. Forcing "identity" pulled the whole
+	// (measured) ~580 KB HTML page through the proxy for every valid cookie,
+	// which is ~6.6x the bytes and burns a metered proxy plan in a day.
 	req.Header.Set("Upgrade-Insecure-Requests", "1")
 	req.Header.Set("Sec-Fetch-Dest", "document")
 	req.Header.Set("Sec-Fetch-Mode", "navigate")
