@@ -1,12 +1,12 @@
 // Package proxy manages the rotating proxy pool.
 // Supports formats: ip:port, user:pass@ip:port, http://ip:port,
-// http://user:pass@ip:port, socks5://user:pass@ip:port
+// http://user:pass@ip:port, socks5://user:pass@ip:port and the bare
+// datacenter forms ip:port:user:pass / user:pass:ip:port
 package proxy
 
 import (
 	"bufio"
 	"crypto/tls"
-	"fmt"
 	"math/rand/v2"
 	"net"
 	"net/http"
@@ -65,9 +65,9 @@ func (p *Proxy) IsAlive() bool {
 	return atomic.LoadUint32(&p.Dead) == 0 && atomic.LoadUint32(&p.removed) == 0
 }
 
-func (p *Proxy) IncrFail() int32  { return atomic.AddInt32(&p.Fails, 1) }
-func (p *Proxy) ResetFails()      { atomic.StoreInt32(&p.Fails, 0) }
-func (p *Proxy) isRemoved() bool  { return atomic.LoadUint32(&p.removed) == 1 }
+func (p *Proxy) IncrFail() int32 { return atomic.AddInt32(&p.Fails, 1) }
+func (p *Proxy) ResetFails()     { atomic.StoreInt32(&p.Fails, 0) }
+func (p *Proxy) isRemoved() bool { return atomic.LoadUint32(&p.removed) == 1 }
 
 // AvgLatencyMs returns the exponential moving average latency in milliseconds.
 func (p *Proxy) AvgLatencyMs() float64 {
@@ -122,12 +122,12 @@ type ProxyStats struct {
 
 // PoolStats holds aggregate pool statistics.
 type PoolStats struct {
-	Total       int          `json:"total"`
-	Alive       int          `json:"alive"`
-	Dead        int          `json:"dead"`
-	Removed     int          `json:"removed"`
-	AvgLatency  float64      `json:"avg_latency_ms"` // across alive proxies
-	Proxies     []ProxyStats `json:"proxies"`
+	Total      int          `json:"total"`
+	Alive      int          `json:"alive"`
+	Dead       int          `json:"dead"`
+	Removed    int          `json:"removed"`
+	AvgLatency float64      `json:"avg_latency_ms"` // across alive proxies
+	Proxies    []ProxyStats `json:"proxies"`
 }
 
 // ---------------------------------------------------------------------------
@@ -163,24 +163,44 @@ func NewPool(maxFailsBeforeDead int) *Pool {
 	return &Pool{maxFail: int32(maxFailsBeforeDead)}
 }
 
-// LoadFromString parses a newline-separated proxy list.
-func (p *Pool) LoadFromString(raw string) int {
+// LoadReport describes what LoadFromString accepted.
+type LoadReport struct {
+	Loaded int
+	// Rejected holds the 1-based line numbers that could not be parsed.
+	// Line numbers (not the lines themselves) are reported so proxy
+	// credentials never travel back out in an API response or a log line.
+	Rejected []int
+}
+
+// LoadFromString parses a newline-separated proxy list. It replaces the
+// whole pool, so an empty list clears it. Blank lines and '#' comments are
+// ignored; unparsable lines are counted in the report instead of silently
+// disappearing.
+func (p *Pool) LoadFromString(raw string) LoadReport {
 	var proxies []*Proxy
+	var rejected []int
 	sc := bufio.NewScanner(strings.NewReader(raw))
+	lineNo := 0
 	for sc.Scan() {
+		lineNo++
 		line := strings.TrimSpace(sc.Text())
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
 		if px := parseProxy(line); px != nil {
 			proxies = append(proxies, px)
+		} else {
+			rejected = append(rejected, lineNo)
 		}
+	}
+	if len(rejected) > 25 {
+		rejected = rejected[:25]
 	}
 	p.mu.Lock()
 	p.proxies = proxies
 	p.mu.Unlock()
 	atomic.StoreInt64(&p.aliveCount, int64(len(proxies)))
-	return len(proxies)
+	return LoadReport{Loaded: len(proxies), Rejected: rejected}
 }
 
 // Alive returns the number of alive (non-dead, non-removed) proxies.
@@ -527,6 +547,20 @@ func ProxyTransport(px *Proxy) *http.Transport {
 // -----------------------------------------------------------------
 
 func parseProxy(raw string) *Proxy {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+
+	// Bare "ip:port:user:pass" (and "user:pass:ip:port") is the usual
+	// datacenter list format: no scheme, no '@', so url.Parse cannot read
+	// it. Handle it before the generic path.
+	if !strings.Contains(raw, "://") && !strings.Contains(raw, "[") {
+		if px := parseBareColon(raw); px != nil {
+			return px
+		}
+	}
+
 	px := &Proxy{Raw: raw}
 
 	s := raw
@@ -555,20 +589,91 @@ func parseProxy(raw string) *Proxy {
 		return nil
 	}
 
-	// Rebuild clean URL
-	rebuild := fmt.Sprintf("%s://", px.Scheme)
+	// Build the dialable URL structurally instead of re-parsing a string, so
+	// passwords containing ':', '@', '%' or spaces survive byte for byte.
+	finalURL := &url.URL{
+		Scheme: px.Scheme,
+		Host:   net.JoinHostPort(px.Host, px.Port),
+	}
 	if px.User != "" {
-		rebuild += url.QueryEscape(px.User) + ":" + url.QueryEscape(px.Pass) + "@"
-	}
-	rebuild += px.Host
-	if px.Port != "" {
-		rebuild += ":" + px.Port
-	}
-
-	finalURL, err := url.Parse(rebuild)
-	if err != nil {
-		return nil
+		finalURL.User = url.UserPassword(px.User, px.Pass)
 	}
 	px.URL = finalURL
 	return px
+}
+
+// parseBareColon understands the colon-separated proxy list formats:
+//
+//	ip:port:user:pass        (password may itself contain ':')
+//	user:pass:ip:port
+func parseBareColon(raw string) *Proxy {
+	parts := strings.Split(raw, ":")
+	if len(parts) < 4 {
+		return nil
+	}
+
+	// ip:port:user:pass
+	if isPortToken(parts[1]) && looksLikeHost(parts[0]) {
+		user := parts[2]
+		pass := strings.Join(parts[3:], ":")
+		if user == "" {
+			return nil
+		}
+		return buildBareProxy(raw, parts[0], parts[1], user, pass)
+	}
+
+	// user:pass:ip:port
+	if len(parts) == 4 && isPortToken(parts[3]) && looksLikeHost(parts[2]) {
+		if parts[0] == "" || parts[1] == "" {
+			return nil
+		}
+		return buildBareProxy(raw, parts[2], parts[3], parts[0], parts[1])
+	}
+
+	return nil
+}
+
+func buildBareProxy(raw, host, port, user, pass string) *Proxy {
+	px := &Proxy{
+		Raw:    raw,
+		Scheme: "http",
+		Host:   host,
+		Port:   port,
+		User:   user,
+		Pass:   pass,
+	}
+	px.URL = &url.URL{
+		Scheme: "http",
+		Host:   net.JoinHostPort(host, port),
+		User:   url.UserPassword(user, pass),
+	}
+	return px
+}
+
+// isPortToken reports whether s is a plain numeric TCP port.
+func isPortToken(s string) bool {
+	if s == "" || len(s) > 5 {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// looksLikeHost reports whether s can be the address part of a proxy entry.
+// Hostnames and IPv4 addresses contain a '.', so a user name or a password
+// in the same position is not mistaken for one.
+func looksLikeHost(s string) bool {
+	if s == "" {
+		return false
+	}
+	// A user name or password segment can contain a '.' too; only accept a
+	// token that could really be an address.
+	if strings.ContainsAny(s, "@/? \t") {
+		return false
+	}
+	return s == "localhost" || strings.Contains(s, ".")
 }

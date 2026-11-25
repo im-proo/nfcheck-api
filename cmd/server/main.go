@@ -22,8 +22,8 @@ import (
 // still be overridden by a flag or the matching environment variable.
 const (
 	defaultWorkersCount = 300
-	defaultRatePerMin    = 0
-	defaultJSONLog       = true
+	defaultRatePerMin   = 0
+	defaultJSONLog      = true
 )
 
 var (
@@ -44,6 +44,7 @@ func main() {
 	maxGOMAXPROCS := flag.Int("gomaxprocs", 0, "Override GOMAXPROCS (0 = use all CPUs)")
 	showVersion := flag.Bool("version", false, "Print version and exit")
 	jsonLog := flag.Bool("json-log", envBool("JSON_LOG", defaultJSONLog), "Output structured JSON logs (default on)")
+	proxiesFile := flag.String("proxies-file", os.Getenv("PROXIES_FILE"), "Load proxies from this file at startup (env: PROXIES_FILE)")
 	flag.Parse()
 
 	if *showVersion {
@@ -75,6 +76,23 @@ func main() {
 	}
 
 	srv := api.NewServer(workerCount, *ratePerMin)
+
+	// Dead proxies come back every 5 minutes so a transient failure cannot
+	// permanently shrink the pool to zero.
+	srv.StartProxyReviver(5*time.Minute, 10*time.Minute)
+
+	if path := strings.TrimSpace(*proxiesFile); path != "" {
+		report, err := srv.LoadProxiesFromFile(path)
+		if err != nil {
+			slog.Error("Proxy file could not be loaded", "path", path, "error", err)
+		} else {
+			slog.Info("Proxies preloaded",
+				"path", path,
+				"loaded", report.Loaded,
+				"rejected_lines", report.Rejected,
+			)
+		}
+	}
 
 	httpSrv := &http.Server{
 		Addr:         *addr,

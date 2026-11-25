@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"mime/multipart"
 	"net/http"
+	"os"
 	"runtime"
 	"sort"
 	"strings"
@@ -446,12 +447,50 @@ func (s *Server) handleUpdateProxies(w http.ResponseWriter, r *http.Request) {
 		raw = req.Proxies
 	}
 
-	n := s.proxyPool.LoadFromString(raw)
-	slog.Info("Proxies updated", "loaded", n, "alive", s.proxyPool.Alive())
-	writeJSON(w, 200, map[string]interface{}{
-		"loaded": n,
+	report := s.proxyPool.LoadFromString(raw)
+	slog.Info("Proxies updated",
+		"loaded", report.Loaded,
+		"alive", s.proxyPool.Alive(),
+		"rejected", len(report.Rejected),
+	)
+	resp := map[string]interface{}{
+		"loaded": report.Loaded,
 		"alive":  s.proxyPool.Alive(),
-	})
+	}
+	if len(report.Rejected) > 0 {
+		resp["rejected_lines"] = report.Rejected
+		resp["rejected"] = len(report.Rejected)
+	}
+	writeJSON(w, 200, resp)
+}
+
+// LoadProxiesFromFile loads a newline-separated proxy file into the pool.
+// Used at startup so a restart does not silently fall back to direct
+// connections and lose the whole pool.
+func (s *Server) LoadProxiesFromFile(path string) (proxy.LoadReport, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return proxy.LoadReport{}, err
+	}
+	return s.proxyPool.LoadFromString(string(data)), nil
+}
+
+// StartProxyReviver periodically brings proxies that were marked dead back
+// into rotation, so a transient failure does not shrink the pool for the
+// lifetime of the process.
+func (s *Server) StartProxyReviver(interval, maxAge time.Duration) {
+	if interval <= 0 || maxAge <= 0 {
+		return
+	}
+	go func() {
+		t := time.NewTicker(interval)
+		defer t.Stop()
+		for range t.C {
+			if n := s.proxyPool.ReviveDead(maxAge); n > 0 {
+				slog.Info("Proxies revived", "count", n, "alive", s.proxyPool.Alive())
+			}
+		}
+	}()
 }
 
 // GET /api/v1/proxies/status
