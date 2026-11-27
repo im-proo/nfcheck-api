@@ -345,6 +345,20 @@ func processCookie(ctx context.Context, cs *models.CookieSet, px *proxy.Proxy) *
 	// Step 2: Extract rich account info
 	acct := checker.ExtractAccountInfo(vr.PageBody, cs)
 
+	// A dead or hijacking proxy can answer 200 with a page that is not the
+	// membership page at all (an ad, a block page, an error document). Such a
+	// page extracts nothing, so it used to be reported as a hit with an
+	// "Unknown" account. Treat it as a failed attempt instead: the retry runs
+	// on another proxy and the job's error count shows the truth.
+	if !acct.HasIdentity() {
+		res.Status = "error"
+		res.Error = "unparsable_page: membership response carried no account details"
+		if px != nil {
+			res.ProxyUsed = px.Raw
+		}
+		return res
+	}
+
 	// A cookie can still open the membership page for a closed account, and
 	// those accounts have no plan and no billing. Counting them as hits is
 	// what made former / never-subscribed logins look like valid accounts.

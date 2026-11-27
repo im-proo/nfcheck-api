@@ -2,6 +2,7 @@
 package models
 
 import (
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -59,6 +60,24 @@ type AccountInfo struct {
 	PlanType           string `json:"plan_type"`           // "premium"/"standard"/"standard_with_ads"/"basic"/"basic_with_ads"/"unknown"
 	IsAdsTier          bool   `json:"is_ads_tier"`         // true if plan contains "ads"
 	MembershipCategory string `json:"membership_category"` // derived from PlanType
+}
+
+// HasIdentity reports whether the membership page yielded any real account
+// detail. A page where every identifying field is empty or "Unknown" did not
+// come from Netflix: a dead or hijacking proxy can answer 200 with an ad page
+// or an error page, and that page must never be read as a logged-in account.
+func (a *AccountInfo) HasIdentity() bool {
+	if a == nil {
+		return false
+	}
+	for _, value := range []string{a.Name, a.Email, a.Plan, a.PlanCode, a.MembershipStatus} {
+		switch strings.ToLower(strings.TrimSpace(value)) {
+		case "", "unknown", "none", "null":
+		default:
+			return true
+		}
+	}
+	return false
 }
 
 // NfToken holds the generated auto-login token.
